@@ -151,6 +151,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 ### Работа с офферами
+# Показываем пользователям только название и цену, описание скрыто до покупки
 async def show_offers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -221,7 +222,7 @@ async def buy_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payload = str(uuid4())
     
     if is_demo:
-        # Демо-доступ - сразу предоставляем товар
+        # Демо-доступ - сразу предоставляем товар и описание
         order_id = str(uuid4())
         conn = _conn()
         cur = conn.cursor()
@@ -235,15 +236,16 @@ async def buy_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"🎉 Демо-доступ предоставлен!\n"
             f"📦 Товар: {title}\n"
+            f"📝 Описание: {description}\n"
             f"✅ Статус: Активен"
         )
     else:
-        # Создание счета для оплаты
+        # Создание счета для оплаты. НЕ передаём полное описание в счёт — пользователь увидит его после оплаты.
         try:
             await context.bot.send_invoice(
                 chat_id=query.from_user.id,
                 title=title,
-                description=description,
+                description="Оплата товара",
                 payload=payload,
                 provider_token=PROVIDER_TOKEN,
                 currency='RUB',
@@ -279,9 +281,15 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     order_id = str(uuid4())
     offer_id = context.user_data.get('offer_id')
     
+    description = ''
     if offer_id:
         conn = _conn()
         cur = conn.cursor()
+        # Получим описание оффера, чтобы показать его клиенту только после оплаты
+        cur.execute("SELECT description FROM offers WHERE id = ?", (offer_id,))
+        row = cur.fetchone()
+        if row:
+            description = row[0] or ''
         cur.execute("""
             INSERT INTO orders (id, user_id, offer_id, status, payload, paid_amount, created_at)
             VALUES (?, ?, ?, 'paid', ?, ?, ?)
@@ -290,15 +298,19 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         conn.commit()
         conn.close()
     
-    # Отправка подтверждения покупки
-    await update.message.reply_text(
+    # Отправка подтверждения покупки и описания
+    msg = (
         f"🎉 Покупка успешно завершена!\n"
         f"💰 Сумма: {payment.total_amount / 100:.0f} ₽\n"
         f"🆔 ID транзакции: {payment.telegram_payment_charge_id}\n\n"
-        f"✅ Доступ к товару активирован!"
     )
+    if description:
+        msg += f"📝 Описание товара:\n{description}\n\n"
+    msg += "✅ Доступ к товару активирован!"
 
-### Мои заказы
+    await update.message.reply_text(msg)
+
+### Мои заказы (история покупок у клиента)
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -306,12 +318,12 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = _conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT o.id, of.title, o.status, o.created_at, o.paid_amount, o.is_demo
+        SELECT o.id, of.title, o.status, o.created_at, o.paid_amount, o.is_demo, o.payload
         FROM orders o
         JOIN offers of ON o.offer_id = of.id
         WHERE o.user_id = ?
         ORDER BY o.created_at DESC
-        LIMIT 10
+        LIMIT 50
     """, (query.from_user.id,))
     orders = cur.fetchall()
     conn.close()
@@ -324,15 +336,14 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    text = "📋 Ваши заказы:\n\n"
-    for order_id, title, status, created_at, paid_amount, is_demo in orders:
+    text = "📋 Ваша история покупок (последние 50):\n\n"
+    for order_id, title, status, created_at, paid_amount, is_demo, payload in orders:
         demo_mark = "🎁 " if is_demo else ""
         status_emoji = "✅" if status == "paid" else "❌"
         amount = f"{paid_amount/100:.0f} ₽" if paid_amount else "Бесплатно"
-        
-        text += f"{demo_mark}{status_emoji} {title}\n"
-        text += f"💰 {amount}\n"
-        text += f"📅 {created_at[:10]}\n\n"
+        date = created_at[:19].replace('T', ' ')
+        text += f"{demo_mark}{status_emoji} {title} — {amount}\n"
+        text += f"📅 {date} — ID заказа: {order_id}\n\n"
     
     keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='back_to_main')]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -418,8 +429,8 @@ async def edit_offer_placeholder(update: Update, context: ContextTypes.DEFAULT_T
         return
     title, desc, price = row
     await query.edit_message_text(
-        f"✏️ Редактирование оффера:\n\n{title}\n{desc}\nЦена: {price/100:.0f} ₽\n\n"
-        "Функция редактирования не реализована — можно добавить через /edit_offer или расширить этот диалог."
+        f"✏️ Оффер:\n\n{title}\nЦена: {price/100:.0f} ₽\n\n"
+        "Чтобы изменить описание, нужно редактировать запись в БД. Описание не показывается клиентам до покупки."
     )
 
 # --- Conversation: Добавление оффера ---
@@ -430,18 +441,21 @@ async def start_add_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("❌ Доступ запрещён")
         return ConversationHandler.END
     # Начинаем диалог: просим название
-    await query.edit_message_text("➕ Введите название оффера (или /cancel чтобы отменить):")
+    context.user_data['add_offer_step'] = TITLE
+    await query.edit_message_text("➕ Введите название оффера (или /cancel чтобы отменить, /back чтобы вернуться):")
     return TITLE
 
 async def add_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Получаем название
     context.user_data['new_offer_title'] = update.message.text.strip()
-    await update.message.reply_text("✏️ Теперь отправьте описание оффера:")
+    context.user_data['add_offer_step'] = DESC
+    await update.message.reply_text("✏️ Теперь отправьте описание оффера (его увидит клиент только после покупки):")
     return DESC
 
 async def add_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['new_offer_desc'] = update.message.text.strip()
-    await update.message.reply_text("💰 И последняя: цена в копейках. Например: 70000 для 700₽")
+    context.user_data['add_offer_step'] = PRICE
+    await update.message.reply_text("💰 И последняя: цена в копейках. Например: 70000 для 700₽ (или /back чтобы вернуться)")
     return PRICE
 
 async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -452,6 +466,7 @@ async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price = int(text)
     title = context.user_data.pop('new_offer_title', '')
     desc = context.user_data.pop('new_offer_desc', '')
+    context.user_data.pop('add_offer_step', None)
     offer_id = str(uuid4())
     conn = _conn()
     cur = conn.cursor()
@@ -468,7 +483,46 @@ async def cancel_add_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text("Отменено")
     else:
         await update.message.reply_text("Отменено")
+    context.user_data.pop('add_offer_step', None)
     return ConversationHandler.END
+
+async def back_add_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Возврат на предыдущий шаг диалога добавления оффера
+    step = context.user_data.get('add_offer_step')
+    if step is None:
+        # нет диалога
+        if update.message:
+            await update.message.reply_text("Нет активного диалога.")
+        else:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text("Нет активного диалога.")
+        return ConversationHandler.END
+
+    if step == PRICE:
+        context.user_data['add_offer_step'] = DESC
+        if update.message:
+            await update.message.reply_text("Возврат. Введите описание оффера:")
+        else:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text("Возврат. Введите описание оффера:")
+        return DESC
+    elif step == DESC:
+        context.user_data['add_offer_step'] = TITLE
+        if update.message:
+            await update.message.reply_text("Возврат. Введите название оффера:")
+        else:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text("Возврат. Введите название оффера:")
+        return TITLE
+    else:
+        # на шаге TITLE — отменяем
+        context.user_data.pop('add_offer_step', None)
+        if update.message:
+            await update.message.reply_text("Отменено")
+        else:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text("Отменено")
+        return ConversationHandler.END
 
 ### Статистика
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -544,7 +598,7 @@ def setup_handlers(application: Application):
             DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_desc)],
             PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_price)],
         },
-        fallbacks=[CommandHandler('cancel', cancel_add_offer)],
+        fallbacks=[CommandHandler('cancel', cancel_add_offer), CommandHandler('back', back_add_offer)],
         allow_reentry=True
     )
     application.add_handler(conv_add)

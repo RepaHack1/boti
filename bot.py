@@ -356,6 +356,120 @@ async def manage_offers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+# --- Новые/обновлённые хендлеры для управления офферами ---
+async def list_offers_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("❌ Доступ запрещён")
+        return
+
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, title, price FROM offers")
+    offers = cur.fetchall()
+    conn.close()
+
+    if not offers:
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='manage_offers')]]
+        await query.edit_message_text("📭 Офферов пока нет", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    keyboard = []
+    for offer_id, title, price in offers:
+        keyboard.append([
+            InlineKeyboardButton(f"{title} ({price/100:.0f} ₽)", callback_data=f'edit_offer_{offer_id}'),
+            InlineKeyboardButton("🗑️ Удалить", callback_data=f'delete_offer_{offer_id}')
+        ])
+    keyboard.append([InlineKeyboardButton("➕ Добавить оффер", callback_data='add_offer')])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='manage_offers')])
+
+    await query.edit_message_text("📋 Список офферов (админ):", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def delete_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    offer_id = query.data[len('delete_offer_'):]
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM offers WHERE id = ?", (offer_id,))
+    conn.commit()
+    conn.close()
+    # Обновим список после удаления
+    await list_offers_admin(update, context)
+
+
+async def edit_offer_placeholder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    offer_id = query.data[len('edit_offer_'):]
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT title, description, price FROM offers WHERE id = ?", (offer_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        await query.edit_message_text("❌ Оффер не найден")
+        return
+    title, desc, price = row
+    await query.edit_message_text(
+        f"✏️ Редактирование оффера:\n\n{title}\n{desc}\nЦена: {price/100:.0f} ₽\n\n"
+        "Функция редактирования не реализована — можно добавить через /edit_offer или расширить этот диалог."
+    )
+
+# --- Conversation: Добавление оффера ---
+async def start_add_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("❌ Доступ запрещён")
+        return ConversationHandler.END
+    # Начинаем диалог: просим название
+    await query.edit_message_text("➕ Введите название оффера (или /cancel чтобы отменить):")
+    return TITLE
+
+async def add_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Получаем название
+    context.user_data['new_offer_title'] = update.message.text.strip()
+    await update.message.reply_text("✏️ Теперь отправьте описание оффера:")
+    return DESC
+
+async def add_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['new_offer_desc'] = update.message.text.strip()
+    await update.message.reply_text("💰 И последняя: цена в копейках. Например: 70000 для 700₽")
+    return PRICE
+
+async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("Ошибка: отправьте цену числом в копейках, например: 70000")
+        return PRICE
+    price = int(text)
+    title = context.user_data.pop('new_offer_title', '')
+    desc = context.user_data.pop('new_offer_desc', '')
+    offer_id = str(uuid4())
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO offers VALUES(?,?,?,?)", (offer_id, title, desc, price))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ Оффер '{title}' добавлен. Цена: {price/100:.0f} ₽")
+    return ConversationHandler.END
+
+async def cancel_add_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Отключение диалога
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("Отменено")
+    else:
+        await update.message.reply_text("Отменено")
+    return ConversationHandler.END
+
 ### Статистика
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -421,19 +535,37 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def setup_handlers(application: Application):
     # Основные команды
     application.add_handler(CommandHandler("start", start))
-    
+
+    # Conversation для добавления оффера (админ)
+    conv_add = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_add_offer, pattern='^add_offer$')],
+        states={
+            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_title)],
+            DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_desc)],
+            PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_price)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel_add_offer)],
+        allow_reentry=True
+    )
+    application.add_handler(conv_add)
+
     # Callback handlers
     application.add_handler(CallbackQueryHandler(show_offers, pattern='^show_offers$'))
     application.add_handler(CallbackQueryHandler(buy_offer, pattern='^buy_'))
     application.add_handler(CallbackQueryHandler(my_orders, pattern='^my_orders$'))
     application.add_handler(CallbackQueryHandler(help_command, pattern='^help$'))
     application.add_handler(CallbackQueryHandler(back_to_main, pattern='^back_to_main$'))
-    
+
     # Админские хендлеры
     application.add_handler(CallbackQueryHandler(admin_menu, pattern='^admin_menu$'))
     application.add_handler(CallbackQueryHandler(manage_offers, pattern='^manage_offers$'))
     application.add_handler(CallbackQueryHandler(stats, pattern='^stats$'))
-    
+
+    # Офферы: список/удаление/редактирование-заглушка
+    application.add_handler(CallbackQueryHandler(list_offers_admin, pattern='^list_offers$'))
+    application.add_handler(CallbackQueryHandler(delete_offer, pattern='^delete_offer_'))
+    application.add_handler(CallbackQueryHandler(edit_offer_placeholder, pattern='^edit_offer_'))
+
     # Платежные хендлеры
     application.add_handler(PreCheckoutQueryHandler(checkout))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))

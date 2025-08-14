@@ -39,7 +39,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # States for conversation handler
-TITLE, DESC, PRICE = range(3)
+TITLE, DESC, PRICE, DEMO_USER_ID = range(4)
 
 # In-memory rate-limit
 _last_purchase = {}
@@ -126,8 +126,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if update.message:
         await update.message.reply_text(text, reply_markup=reply_markup)
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
 
 ### Административное меню
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -145,10 +145,85 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 Назад", callback_data='back_to_main')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(
+    await query.message.reply_text(
         "⚙️ Административное меню:",
         reply_markup=reply_markup
     )
+
+### Управление демо-доступом
+async def manage_demo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("❌ Доступ запрещён")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить демо-доступ", callback_data='add_demo_user')],
+        [InlineKeyboardButton("📋 Список демо-пользователей", callback_data='list_demo_users')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='admin_menu')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.message.reply_text(
+        "🔍 Управление демо-доступом:",
+        reply_markup=reply_markup
+    )
+
+async def list_demo_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("❌ Доступ запрещён")
+        return
+    
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, granted_by, granted_at FROM demo_exceptions")
+    demo_users = cur.fetchall()
+    conn.close()
+    
+    if not demo_users:
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='manage_demo')]]
+        await query.message.reply_text(
+            "📭 Пользователей с демо-доступом пока нет",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
+    text = "📋 Пользователи с демо-доступом:\n\n"
+    keyboard = []
+    
+    for user_id, granted_by, granted_at in demo_users:
+        date = granted_at[:19].replace('T', ' ') if granted_at else "Неизвестно"
+        text += f"👤 ID: {user_id}\n📅 Добавлен: {date}\n👨‍💼 Админ ID: {granted_by}\n\n"
+        keyboard.append([
+            InlineKeyboardButton(f"🗑️ Удалить {user_id}", callback_data=f'remove_demo_{user_id}')
+        ])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='manage_demo')])
+    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def remove_demo_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("❌ Доступ запрещён")
+        return
+    
+    user_id = query.data.split('_')[2]  # remove_demo_{user_id}
+    
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM demo_exceptions WHERE user_id = ?", (int(user_id),))
+    conn.commit()
+    conn.close()
+    
+    await query.message.reply_text(f"✅ Демо-доступ для пользователя {user_id} удален")
+    # Показываем обновленный список
+    await list_demo_users(update, context)
 
 ### Работа с офферами
 # Показываем пользователям только название и цену, описание скрыто до покупки
@@ -164,7 +239,7 @@ async def show_offers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not offers:
         keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='back_to_main')]]
-        await query.edit_message_text(
+        await query.message.reply_text(
             "📭 Офферов пока нет",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -174,7 +249,7 @@ async def show_offers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for offer_id, title, price in offers:
         keyboard.append([
             InlineKeyboardButton(
-                f"{title} ({price/100:.0f} 2)",
+                f"{title} ({price/100:.0f} ₽)",
                 callback_data=f'buy_{offer_id}'
             )
         ])
@@ -182,7 +257,7 @@ async def show_offers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='back_to_main')])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(
+    await query.message.reply_text(
         "🎯 Доступные офферы:",
         reply_markup=reply_markup
     )
@@ -205,7 +280,7 @@ async def buy_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     
     if not offer:
-        await query.edit_message_text("❌ Оффер не найден")
+        await query.message.reply_text("❌ Оффер не найден")
         return
     
     title, description, price = offer
@@ -233,11 +308,11 @@ async def buy_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         
-        await query.edit_message_text(
-            f"🎉 Демо-доступ предоставлен!\n"
-            f"📦 Товар: {title}\n"
-            f"📝 Описание: {description}\n"
-            f"✅ Статус: Активен"
+        await query.message.reply_text(
+            f"🎉 Демо-доступ предоставлен!\n"
+            f"📦 Товар: {title}\n"
+            f"📝 Описание: {description}\n"
+            f"✅ Статус: Активен"
         )
     else:
         # Создание счета для оплаты. НЕ передаём полное описание в счёт — пользователь увидит его после оплаты.
@@ -260,7 +335,7 @@ async def buy_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         except Exception as e:
             logger.error(f"Error sending invoice: {e}")
-            await query.edit_message_text("❌ Ошибка при создании счета. Попробуйте позже.")
+            await query.message.reply_text("❌ Ошибка при создании счета. Попробуйте позже.")
 
 ### Обработка пречека
 async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -301,7 +376,7 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Отправка подтверждения покупки и описания
     msg = (
         f"🎉 Покупка успешно завершена!\n"
-        f"💰 Сумма: {payment.total_amount / 100:.0f} 2\n"
+        f"💰 Сумма: {payment.total_amount / 100:.0f} ₽\n"
         f"🆔 ID транзакции: {payment.telegram_payment_charge_id}\n\n"
     )
     if description:
@@ -330,7 +405,7 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not orders:
         keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='back_to_main')]]
-        await query.edit_message_text(
+        await query.message.reply_text(
             "📭 У вас пока нет заказов",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -340,13 +415,13 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for order_id, title, status, created_at, paid_amount, is_demo, payload in orders:
         demo_mark = "🎁 " if is_demo else ""
         status_emoji = "✅" if status == "paid" else "❌"
-        amount = f"{paid_amount/100:.0f} 2" if paid_amount else "Бесплатно"
+        amount = f"{paid_amount/100:.0f} ₽" if paid_amount else "Бесплатно"
         date = created_at[:19].replace('T', ' ')
-        text += f"{demo_mark}{status_emoji} {title}  {amount}\n"
+        text += f"{demo_mark}{status_emoji} {title} — {amount}\n"
         text += f"📅 {date} — ID заказа: {order_id}\n\n"
     
     keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='back_to_main')]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 ### Админка - управление офферами
 async def manage_offers(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -362,7 +437,7 @@ async def manage_offers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 Назад", callback_data='admin_menu')]
     ]
     
-    await query.edit_message_text(
+    await query.message.reply_text(
         "📋 Управление офферами:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -383,19 +458,19 @@ async def list_offers_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not offers:
         keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='manage_offers')]]
-        await query.edit_message_text("📭 Офферов пока нет", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text("📭 Офферов пока нет", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     keyboard = []
     for offer_id, title, price in offers:
         keyboard.append([
-            InlineKeyboardButton(f"{title} ({price/100:.0f} 2)", callback_data=f'edit_offer_{offer_id}'),
+            InlineKeyboardButton(f"{title} ({price/100:.0f} ₽)", callback_data=f'edit_offer_{offer_id}'),
             InlineKeyboardButton("🗑️ Удалить", callback_data=f'delete_offer_{offer_id}')
         ])
     keyboard.append([InlineKeyboardButton("➕ Добавить оффер", callback_data='add_offer')])
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='manage_offers')])
 
-    await query.edit_message_text("📋 Список офферов (админ):", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.message.reply_text("📋 Список офферов (админ):", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def delete_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -409,6 +484,7 @@ async def delete_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("DELETE FROM offers WHERE id = ?", (offer_id,))
     conn.commit()
     conn.close()
+    await query.message.reply_text("✅ Оффер удален")
     # Обновим список после удаления
     await list_offers_admin(update, context)
 
@@ -425,11 +501,11 @@ async def edit_offer_placeholder(update: Update, context: ContextTypes.DEFAULT_T
     row = cur.fetchone()
     conn.close()
     if not row:
-        await query.edit_message_text("❌ Оффер не найден")
+        await query.message.reply_text("❌ Оффер не найден")
         return
     title, desc, price = row
-    await query.edit_message_text(
-        f"✏️ Оффер:\n\n{title}\nЦена: {price/100:.0f} 2\n\n"
+    await query.message.reply_text(
+        f"✏️ Оффер:\n\n{title}\nЦена: {price/100:.0f} ₽\n\n"
         "Чтобы изменить описание, нужно редактировать запись в БД. Описание не показывается клиентам до покупки."
     )
 
@@ -442,7 +518,7 @@ async def start_add_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     # Начинаем диалог: просим название
     context.user_data['add_offer_step'] = TITLE
-    await query.edit_message_text("➕ Введите название оффера (или /cancel чтобы отменить, /back чтобы вернуться):")
+    await query.message.reply_text("➕ Введите название оффера (или /cancel чтобы отменить, /back чтобы вернуться):")
     return TITLE
 
 async def add_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -473,14 +549,14 @@ async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("INSERT INTO offers VALUES(?,?,?,?)", (offer_id, title, desc, price))
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"✅ Оффер '{title}' добавлен. Цена: {price/100:.0f} 2")
+    await update.message.reply_text(f"✅ Оффер '{title}' добавлен. Цена: {price/100:.0f} ₽")
     return ConversationHandler.END
 
 async def cancel_add_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Отключение диалога
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text("Отменено")
+        await update.callback_query.message.reply_text("Отменено")
     else:
         await update.message.reply_text("Отменено")
     context.user_data.pop('add_offer_step', None)
@@ -495,7 +571,7 @@ async def back_add_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Нет активного диалога.")
         else:
             await update.callback_query.answer()
-            await update.callback_query.edit_message_text("Нет активного диалога.")
+            await update.callback_query.message.reply_text("Нет активного диалога.")
         return ConversationHandler.END
 
     if step == PRICE:
@@ -504,7 +580,7 @@ async def back_add_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Возврат. Введите описание оффера:")
         else:
             await update.callback_query.answer()
-            await update.callback_query.edit_message_text("Возврат. Введите описание оффера:")
+            await update.callback_query.message.reply_text("Возврат. Введите описание оффера:")
         return DESC
     elif step == DESC:
         context.user_data['add_offer_step'] = TITLE
@@ -512,7 +588,7 @@ async def back_add_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Возврат. Введите название оффера:")
         else:
             await update.callback_query.answer()
-            await update.callback_query.edit_message_text("Возврат. Введите название оффера:")
+            await update.callback_query.message.reply_text("Возврат. Введите название оффера:")
         return TITLE
     else:
         # на шаге TITLE — отменяем
@@ -521,8 +597,56 @@ async def back_add_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Отменено")
         else:
             await update.callback_query.answer()
-            await update.callback_query.edit_message_text("Отменено")
+            await update.callback_query.message.reply_text("Отменено")
         return ConversationHandler.END
+
+# --- Conversation: Добавление демо-пользователя ---
+async def start_add_demo_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("❌ Доступ запрещён")
+        return ConversationHandler.END
+    
+    await query.message.reply_text("👤 Введите ID пользователя для предоставления демо-доступа (или /cancel для отмены):")
+    return DEMO_USER_ID
+
+async def add_demo_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("Ошибка: отправьте числовой ID пользователя")
+        return DEMO_USER_ID
+    
+    user_id = int(text)
+    admin_id = update.effective_user.id
+    
+    # Проверяем, не добавлен ли уже этот пользователь
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM demo_exceptions WHERE user_id = ?", (user_id,))
+    if cur.fetchone()[0] > 0:
+        await update.message.reply_text("❌ Этот пользователь уже имеет демо-доступ")
+        conn.close()
+        return ConversationHandler.END
+    
+    # Добавляем пользователя
+    cur.execute("""
+        INSERT INTO demo_exceptions (user_id, granted_by, granted_at)
+        VALUES (?, ?, ?)
+    """, (user_id, admin_id, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(f"✅ Демо-доступ предоставлен пользователю {user_id}")
+    return ConversationHandler.END
+
+async def cancel_add_demo_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text("Отменено")
+    else:
+        await update.message.reply_text("Отменено")
+    return ConversationHandler.END
 
 ### Статистика
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -553,18 +677,23 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT COUNT(*) FROM offers")
     offers_count = cur.fetchone()[0]
     
+    # Количество демо-пользователей
+    cur.execute("SELECT COUNT(*) FROM demo_exceptions")
+    demo_users_count = cur.fetchone()[0]
+    
     conn.close()
     
     text = f"📊 Статистика:\n\n"
     text += f"📦 Офферов: {offers_count}\n"
+    text += f"👤 Демо-пользователей: {demo_users_count}\n"
     text += f"📋 Всего заказов: {total_orders}\n"
-    text += f"💰 Общий доход: {total_revenue / 100:.0f} 2\n\n"
+    text += f"💰 Общий доход: {total_revenue / 100:.0f} ₽\n\n"
     text += f"📅 Сегодня:\n"
     text += f"📋 Заказов: {today_orders}\n"
-    text += f"💰 Доход: {today_revenue / 100:.0f} 2"
+    text += f"💰 Доход: {today_revenue / 100:.0f} ₽"
     
     keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='admin_menu')]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 ### Помощь
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -579,7 +708,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❓ Если у вас возникли вопросы, обратитесь к администратору")
     
     keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='back_to_main')]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 ### Обработчики навигации
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -603,6 +732,17 @@ def setup_handlers(application: Application):
     )
     application.add_handler(conv_add)
 
+    # Conversation для добавления демо-пользователя (админ)
+    conv_demo = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_add_demo_user, pattern='^add_demo_user$')],
+        states={
+            DEMO_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_demo_user_id)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel_add_demo_user)],
+        allow_reentry=True
+    )
+    application.add_handler(conv_demo)
+
     # Callback handlers
     application.add_handler(CallbackQueryHandler(show_offers, pattern='^show_offers$'))
     application.add_handler(CallbackQueryHandler(buy_offer, pattern='^buy_'))
@@ -614,9 +754,11 @@ def setup_handlers(application: Application):
     application.add_handler(CallbackQueryHandler(admin_menu, pattern='^admin_menu$'))
     application.add_handler(CallbackQueryHandler(manage_offers, pattern='^manage_offers$'))
     application.add_handler(CallbackQueryHandler(stats, pattern='^stats$'))
-
-    # Добавляем исправленный хендлер управления демо
+    
+    # Демо-управление
     application.add_handler(CallbackQueryHandler(manage_demo, pattern='^manage_demo$'))
+    application.add_handler(CallbackQueryHandler(list_demo_users, pattern='^list_demo_users$'))
+    application.add_handler(CallbackQueryHandler(remove_demo_user, pattern='^remove_demo_'))
 
     # Офферы: список/удаление/редактирование-заглушка
     application.add_handler(CallbackQueryHandler(list_offers_admin, pattern='^list_offers$'))
